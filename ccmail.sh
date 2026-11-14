@@ -6,7 +6,7 @@
 #  Usage:  sudo bash ccmail.sh <command>
 #    first    START HERE at drop flag: passwd -> evict -> sshd -> disk -> backup -> recon -> fw -> check
 #    recon    snapshot of the box to /root/ccdc/ (read-only)
-#    backup   back up configs + Roundcube (+ mail if it fits) and record a hash baseline
+#    backup   disguised, backdated, optionally encrypted backup of configs + Roundcube (+ mail if it fits)
 #    evict    remove known planted backdoors (SSH keys, fake mod_coraza, rogue units) - asks first
 #    passwd   zulu-compatible: root/ccdcuser1/ccdcuser2 by hand, everyone else from the team seed phrase
 #    seedshow show the seed password for a user:  bash ccmail.sh seedshow sysadmin
@@ -17,7 +17,7 @@
 #    hunt     re-runnable threat hunt (run every 15-20 min)
 #    check    scoring health check of every dependency
 #    disk     free disk space (root fs starts ~96% full)
-#    restore  list backups and show restore commands
+#    restore  restore one piece:  bash ccmail.sh restore postfix|dovecot|apache2|roundcube|sssd|ssh|pam.d|list
 #    rebase   accept current configs as the new baseline (after your own changes)
 #    sqlpass  after Ben changes the roundcube SQL password: test it, update Roundcube, verify, undo if broken
 #
@@ -138,15 +138,31 @@ cmd_disk() {
 }
 
 # =============================== backup ===============================
+# Backups are disguised as package docs in a RANDOM package folder each run, backdated to match
+# nearby system files, optionally encrypted. Locations are only recorded in /root/ccdc/backup.list.
+BK_DECOYS="libnss-sss-extra libpam-cracklib-data libgssapi-krb5-3 libsasl2-modules-gssapi liblmdb-utils libkrb5-doc-extra python3-ldap3-doc libverto-glib1"
+BK_CONF="/etc/postfix /etc/dovecot /etc/apache2 /etc/ssl /etc/sssd /etc/pam.d /etc/ssh /etc/passwd /etc/shadow /etc/group /etc/sudoers /etc/sudoers.d /etc/aliases /etc/mailname /etc/krb5.conf /etc/hosts /etc/resolv.conf /etc/php /etc/systemd/system /etc/crontab /etc/cron.d /etc/chrony /etc/iptables"
+bk_enc() { if [ -n "$BKPASS" ]; then openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:BKPASS; else cat; fi; }
+bk_dec() { if [ "$1" = 1 ]; then openssl enc -d -aes-256-cbc -pbkdf2 -pass env:BKPASS; else cat; fi; }
+bk_hide() {  # backdate files + folders so nothing looks freshly made
+  local ref=/usr/share/doc/bash/copyright; [ -e "$ref" ] || ref=/etc/hostname
+  local f; for f in "$@"; do [ -e "$f" ] && touch -h -r "$ref" "$f"; done
+}
 cmd_backup() {
-  hdr "BACKUP"
-  local dir; dir="/var/backups/.sysstat-$(TS)"   # innocuous name
-  mkdir -p "$dir"; chmod 700 "$dir"
-  local paths="/etc/postfix /etc/dovecot /etc/apache2 /etc/ssl /etc/sssd /etc/pam.d /etc/ssh /etc/passwd /etc/shadow /etc/group /etc/sudoers /etc/sudoers.d /etc/aliases /etc/mailname /etc/krb5.conf /etc/hosts /etc/resolv.conf /etc/php /etc/systemd/system /etc/crontab /etc/cron.d"
+  hdr "BACKUP (disguised)"
+  tip "Backups are saved as fake package docs with old timestamps. Optional passphrase encrypts them (configs contain the DB password)."
+  tip "If you set a passphrase you MUST remember it to restore. Enter = no encryption."
+  local a b2; BKPASS=""
+  read -r -s -p "  Backup passphrase (Enter = none): " a </dev/tty 2>/dev/null; echo
+  if [ -n "$a" ]; then read -r -s -p "  Confirm: " b2 </dev/tty 2>/dev/null; echo; [ "$a" = "$b2" ] && export BKPASS="$a" || { warn "didn't match - saving UNencrypted"; }; fi
+  local enc=0; [ -n "$BKPASS" ] && enc=1
+  local pkgs=($BK_DECOYS) pkg; pkg=${pkgs[$((RANDOM % ${#pkgs[@]}))]}
+  local d1=/usr/share/doc/$pkg d2=/usr/share/locale/en_GB/LC_MESSAGES
+  local t_doc t_d2; t_doc=$(stat -c %Y /usr/share/doc); mkdir -p "$d2"; t_d2=$(stat -c %Y "$d2")
+  mkdir -p "$d1"; chmod 755 "$d1"
   # shellcheck disable=SC2086
-  tar -czf "$dir/etc.tgz" $paths 2>/dev/null && ok "configs -> $dir/etc.tgz ($(du -h "$dir/etc.tgz" | cut -f1))"
-  [ -d /opt/roundcube ] && tar -czf "$dir/roundcube.tgz" --exclude='/opt/roundcube/temp/*' --exclude='/opt/roundcube/logs/*' /opt/roundcube 2>/dev/null && ok "roundcube -> $dir/roundcube.tgz ($(du -h "$dir/roundcube.tgz" | cut -f1))"
-  # mail stores: only if they fit
+  tar -czf - $BK_CONF 2>/dev/null | bk_enc > "$d1/changelog.Debian.gz" && ok "configs saved ($(du -h "$d1/changelog.Debian.gz" | cut -f1))"
+  [ -d /opt/roundcube ] && tar -czf - --exclude='/opt/roundcube/temp/*' --exclude='/opt/roundcube/logs/*' /opt/roundcube 2>/dev/null | bk_enc > "$d1/NEWS.Debian.gz" && ok "roundcube saved ($(du -h "$d1/NEWS.Debian.gz" | cut -f1))"
   local mailpaths="" p
   for p in /var/mail /var/spool/mail /var/vmail /home/*/Maildir /home/*/mail; do [ -e "$p" ] && mailpaths="$mailpaths $p"; done
   if [ -n "$mailpaths" ]; then
@@ -154,34 +170,65 @@ cmd_backup() {
     local need; need=$(du -scm $mailpaths 2>/dev/null | tail -1 | cut -f1); local free; free=$(df --output=avail -m / | tail -1)
     if [ "$need" -lt $((free/2)) ]; then
       # shellcheck disable=SC2086
-      tar -czf "$dir/mail.tgz" $mailpaths 2>/dev/null && ok "mail (${need}MB raw) -> $dir/mail.tgz"
-    else warn "mail is ${need}MB, only ${free}MB free: skipped. Run 'disk' then 'backup' again, or copy mail off-box."; fi
+      tar -czf - $mailpaths 2>/dev/null | bk_enc > "$d1/README.Debian.gz" && ok "mail saved (${need}MB raw)"
+    else warn "mail is ${need}MB, only ${free}MB free: skipped. Run 'disk' then 'backup' again."; fi
   fi
+  printf 'This package provides extra documentation.\n' | gzip > "$d1/copyright.gz" 2>/dev/null
+  cp "$d1/changelog.Debian.gz" "$d2/$pkg.mo"                     # second copy of configs
+  chmod 644 "$d1"/* "$d2/$pkg.mo"
+  bk_hide "$d1"/* "$d1" "$d2/$pkg.mo"
+  touch -d "@$t_doc" /usr/share/doc; touch -d "@$t_d2" "$d2"       # parent folders keep their old times
+  echo "$(date '+%H:%M')|$enc|$d1|$d2/$pkg.mo" >> "$D/backup.list"; chmod 600 "$D/backup.list"
+  unset BKPASS
   # hash baseline for integrity checks in hunt
   find /opt/roundcube /etc/postfix /etc/dovecot /etc/apache2 /etc/pam.d /etc/ssh /usr/lib/apache2/modules -type f -not -path '*/temp/*' -not -path '*/logs/*' -exec sha256sum {} + 2>/dev/null > "$D/baseline.sha256"
   ss -tlnH | awk '{print $4}' | sort -u > "$D/baseline.ports"
   awk -F: '{print $1":"$3":"$7}' /etc/passwd | sort > "$D/baseline.passwd"
-  mkdir -p /root/.cache-bk; cp -a "$dir"/etc.tgz "$dir"/roundcube.tgz /root/.cache-bk/ 2>/dev/null
-  ok "baseline hashes: $D/baseline.sha256 ($(wc -l <"$D/baseline.sha256") files)"
-  ok "second copy of configs + roundcube: /root/.cache-bk/"
-  echo "$dir" >> "$D/backup.list"
-  note "backup -> $dir"
-  say "Tip: also copy etc.tgz + roundcube.tgz OFF the box (scp to the Ubuntu workstation) if you can."
+  ok "saved to: $d1/   (+ copy: $d2/$pkg.mo)   encrypted: $([ $enc = 1 ] && echo yes || echo no)"
+  tip "Write the folder name ($pkg) on your team sheet. Restore with:  bash $0 restore"
+  note "backup -> $d1 (enc=$enc)"
 }
 
-cmd_restore() {
+cmd_restore() {  # restore [postfix|dovecot|apache2|roundcube|sssd|ssh|pam.d|ssl|php|mail|list]
   hdr "RESTORE"
-  [ -f "$D/backup.list" ] || { bad "no backups recorded"; return; }
-  cat "$D/backup.list"
-  local last; last=$(tail -1 "$D/backup.list")
-  cat <<EOF
-Restore examples (latest = $last):
-  tar -tzf $last/etc.tgz | less                          # list contents
-  tar -xzf $last/etc.tgz -C / etc/postfix                # restore just postfix config
-  tar -xzf $last/etc.tgz -C / etc/dovecot ; systemctl restart dovecot
-  tar -xzf $last/roundcube.tgz -C / ; systemctl reload apache2
-  Per-file backups from this script: $BAK/<original path>/<file>.<timestamp>
-EOF
+  [ -s "$D/backup.list" ] || { bad "no backups recorded in $D/backup.list"; return 1; }
+  local i=0 line; echo "  Backups (1 = first = cleanest):"
+  while IFS='|' read -r tm en d1 d2; do i=$((i+1)); echo "   $i) $tm  $d1  encrypted=$([ "$en" = 1 ] && echo yes || echo no)"; done < "$D/backup.list"
+  local n=1; [ "$i" -gt 1 ] && { read -r -p "  Which backup? [1]: " n; n=${n:-1}; }
+  line=$(sed -n "${n}p" "$D/backup.list"); [ -n "$line" ] || { bad "no backup #$n"; return 1; }
+  local tm en d1 d2; IFS='|' read -r tm en d1 d2 <<<"$line"
+  local what=$2
+  if [ -z "$what" ]; then
+    echo "  What to restore: postfix dovecot apache2 roundcube sssd ssh pam.d ssl php mail list"
+    read -r -p "  Type one: " what
+  fi
+  local arch="$d1/changelog.Debian.gz" path svc
+  case "$what" in
+    postfix) path=etc/postfix; svc=postfix;;  dovecot) path=etc/dovecot; svc=dovecot;;
+    apache2) path=etc/apache2; svc=apache2;;  sssd) path=etc/sssd; svc=sssd;;
+    ssh) path=etc/ssh; svc=ssh;;  pam.d) path=etc/pam.d;;  ssl) path=etc/ssl; svc=apache2;;  php) path=etc/php; svc=apache2;;
+    roundcube) arch="$d1/NEWS.Debian.gz"; path=opt/roundcube; svc=apache2;;
+    mail) arch="$d1/README.Debian.gz"; path="";;
+    list) ;;
+    *) bad "unknown: $what"; return 1;;
+  esac
+  [ -s "$arch" ] || { [ "$arch" = "$d1/changelog.Debian.gz" ] && [ -s "$d2" ] && arch=$d2 && warn "main copy missing, using second copy $d2"; }
+  [ -s "$arch" ] || { bad "backup file missing: $arch (red team may have deleted it)"; return 1; }
+  if [ "$en" = 1 ]; then read -r -s -p "  Backup passphrase: " BKPASS; echo; export BKPASS; fi
+  bk_dec "$en" < "$arch" | tar -tzf - >/dev/null 2>&1 || { bad "can't open the backup (wrong passphrase?)"; unset BKPASS; return 1; }
+  if [ "$what" = list ]; then bk_dec "$en" < "$arch" | tar -tzf - | awk -F/ '{print $1"/"$2}' | sort -u; unset BKPASS; return; fi
+  # save current state first so this restore can be undone
+  [ -n "$path" ] && [ -e "/$path" ] && tar -czf "$BAK/pre-restore-${what}-$(TS).tgz" "/$path" 2>/dev/null && ok "current /$path saved to $BAK/pre-restore-${what}-*.tgz (undo)"
+  if [ -n "$path" ]; then bk_dec "$en" < "$arch" | tar -xzf - -C / "$path"; else bk_dec "$en" < "$arch" | tar -xzf - -C /; fi \
+    && ok "restored ${path:-mail} from backup $n ($tm)" && note "RESTORED $what from $d1"
+  unset BKPASS
+  case "$svc" in
+    apache2) apache2ctl configtest && systemctl restart apache2 && ok "apache2 restarted";;
+    ssh) sshd -t && systemctl restart ssh && ok "ssh restarted";;
+    "") ;;
+    *) systemctl restart "$svc" && ok "$svc restarted" || bad "$svc failed to restart: journalctl -u $svc -n 30";;
+  esac
+  tip "Run: bash $0 check"
 }
 
 # =============================== evict ===============================
@@ -642,7 +689,7 @@ cmd_first() {
   cmd_sshd
   stage 4 "Free disk space" "logs, apt cache, old snaps (disk starts ~96% full)" "y to remove the PowerShell snap"
   cmd_disk
-  stage 5 "Backups" "configs + Roundcube (+ mail if it fits) and a fingerprint of every config file" "nothing (automatic)"
+  stage 5 "Backups" "disguised + backdated copies of configs and Roundcube, plus a fingerprint of every config file" "optional passphrase (Enter = none)"
   cmd_backup
   stage 6 "Recon" "snapshot of users, ports, services into a file for injects/IR" "nothing (automatic)"
   cmd_recon
@@ -656,11 +703,12 @@ cmd_first() {
   echo
   ok "Next:  bash $0 mail     (mail-service hardening, ~2 min)"
   ok "Then:  bash $0 hunt; bash $0 check     every 15 minutes"
-  ok "Broken?  bash $0 fwoff  (if you suspect the firewall)   |   bash $0 restore  (restore configs)"
+  ok "Broken?  bash $0 fwoff  (if you suspect the firewall)   |   bash $0 restore postfix  (or dovecot, apache2, roundcube...)"
 }
 
 case "$1" in
-  first|recon|disk|backup|restore|evict|passwd|sshd|fw|fwoff|mail|hunt|check|rebase|sqlpass) "cmd_$1" ;;
+  first|recon|disk|backup|evict|passwd|sshd|fw|fwoff|mail|hunt|check|rebase|sqlpass) "cmd_$1" ;;
+  restore) cmd_restore "$@" ;;
   seedshow) cmd_seedshow "$@" ;;
   *) sed -n '2,28p' "$0"; echo; echo "  ${G}Start here:  bash $0 first${N}" ;;
 esac
