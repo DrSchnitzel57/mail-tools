@@ -4,11 +4,12 @@
 #  Postfix + Dovecot + Apache/Roundcube + SSSD(AD) + Roundcube DB on MSSQL
 #
 #  Usage:  sudo bash ccmail.sh <command>
-#    first    run the drop-flag sequence: disk -> backup -> recon -> evict -> passwd -> fw -> check
+#    first    START HERE at drop flag: passwd -> evict -> sshd -> disk -> backup -> recon -> fw -> check
 #    recon    snapshot of the box to /root/ccdc/ (read-only)
 #    backup   back up configs + Roundcube (+ mail if it fits) and record a hash baseline
 #    evict    remove known planted backdoors (SSH keys, fake mod_coraza, rogue units) - asks first
-#    passwd   change root/sysadmin/ccdcuser1 passwords, lock other local shell users
+#    passwd   zulu-compatible: root/ccdcuser1/ccdcuser2 by hand, everyone else from the team seed phrase
+#    seedshow show the seed password for a user:  bash ccmail.sh seedshow sysadmin
 #    sshd     harden sshd with a drop-in (keeps password auth for the scorer)
 #    fw       iptables firewall with automatic 90s rollback if you lose access
 #    fwoff    flush the firewall (emergency: scoring is down and you suspect the fw)
@@ -31,7 +32,7 @@ SQL_IP="172.20.240.120"         # MSSQL (Roundcube DB lives here)
 SPLUNK_IP="172.20.240.20"       # Splunk indexer (9997) / syslog
 MY_IP="172.20.240.15"
 PUBLIC_IP="172.25.$((20+TEAM)).15"
-ADMIN_USERS="root sysadmin ccdcuser1"     # local accounts we keep and rotate
+ADMIN_USERS="root sysadmin ccdcuser1 ccdcuser2"     # local accounts we keep
 IN_TCP="22,25,80,110,143,443,465,587,993,995"   # inbound scored/mail ports
 ALLOW_WEB_OUT="${ALLOW_WEB_OUT:-1}"   # 1 = allow outbound 80/443 anywhere (apt, github). Set 0 after updates.
 ALLOW_SMTP_OUT="${ALLOW_SMTP_OUT:-1}" # 1 = allow outbound 25 (mail relay to other hosts)
@@ -46,14 +47,24 @@ warn() { echo "${Y}[!]${N} $*"; }
 bad()  { echo "${R}[X] $*${N}"; }
 hdr()  { echo; echo "${B}==================== $* ====================${N}"; }
 note() { echo "$(date '+%H:%M:%S') $*" >> "$LOG"; }          # change log for injects/IR
-ask()  { local a; read -r -p "${Y}[?]${N} $* [y/N] " a; [[ $a =~ ^[Yy] ]]; }
+ask()  { local a; read -r -p "${Y}[?]${N} $* ${Y}[y = yes, Enter = no]${N} " a; [[ $a =~ ^[Yy] ]]; }
+tip()  { echo "    ${B}->${N} $*"; }                                # plain-English hint
+stage() { # stage <n> <title> <what it does> <what you will be asked>
+  echo; echo "${G}################################################################${N}"
+  echo "${G}  STEP $1/8: $2${N}"; echo "${G}################################################################${N}"
+  echo "  What it does : $3"; echo "  You'll answer: $4"
+  read -r -p "  Press Enter to start this step (Ctrl-C quits safely) " _ 2>/dev/null </dev/tty || true; }
 bk()   { [ -e "$1" ] || return 0; local t; t="$BAK$(dirname "$1")"; mkdir -p "$t"; cp -a "$1" "$t/$(basename "$1").$(TS)"; }
 quar() { [ -e "$1" ] || return 0; mkdir -p "$Q"; local t; t="$Q/$(echo "$1" | tr / _).$(TS)"; mv "$1" "$t"; chmod 000 "$t"; warn "quarantined $1 -> $t"; note "QUARANTINE $1 -> $t"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 port_up() { timeout 3 bash -c "</dev/tcp/$1/$2" 2>/dev/null; }
+# package ownership: one index of every dpkg-owned file, with /usr merged away (works on 22.04 and 24.04)
+OWNED=/root/ccdc/.owned
+build_owned() { mkdir -p /root/ccdc; cat /var/lib/dpkg/info/*.list 2>/dev/null | sed -E 's#^/usr/#/#' | sort -u > "$OWNED"; }
+owned() { [ -s "$OWNED" ] || build_owned; local p; p=$(readlink -f "$1" 2>/dev/null || echo "$1"); p=${p#/usr}; grep -qxF "$p" "$OWNED" || grep -qxF "${1#/usr}" "$OWNED"; }
 
 [ "$(id -u)" -eq 0 ] || { echo "Run as root: sudo bash $0 $*"; exit 1; }
-mkdir -p "$D" "$BAK" "$Q"; chmod 700 "$D"
+mkdir -p "$D" "$BAK" "$Q"; chmod 700 "$D"; build_owned
 
 # =============================== recon ===============================
 cmd_recon() {
@@ -73,7 +84,7 @@ cmd_recon() {
     echo "### crontabs";  ls -la /etc/cron* /var/spool/cron/crontabs 2>/dev/null; cat /etc/crontab; for c in /var/spool/cron/crontabs/*; do [ -f "$c" ] && { echo "--- $c"; cat "$c"; }; done
     echo "### timers";    systemctl list-timers --all --no-pager
     echo "### running services"; systemctl list-units --type=service --state=running --no-pager
-    echo "### unit files in /etc/systemd/system (not from packages)"; for u in /etc/systemd/system/*.service /lib/systemd/system/*.service; do dpkg -S "$u" >/dev/null 2>&1 || { echo "--- $u"; grep -E '^(Description|ExecStart)' "$u"; }; done
+    echo "### unit files in /etc/systemd/system (not from packages)"; for u in /etc/systemd/system/*.service /lib/systemd/system/*.service; do owned "$u" || { echo "--- $u"; grep -E '^(Description|ExecStart)' "$u"; }; done
     echo "### ld.so.preload"; cat /etc/ld.so.preload 2>/dev/null
     echo "### apache modules"; apache2ctl -M 2>/dev/null; ls -la /etc/apache2/mods-enabled/
     echo "### apache sites"; ls -la /etc/apache2/sites-enabled/; cat /etc/apache2/sites-enabled/*.conf
@@ -83,7 +94,7 @@ cmd_recon() {
     echo "### sssd"; cat /etc/sssd/sssd.conf 2>/dev/null; realm list 2>/dev/null
     echo "### pam modules in use"; grep -rhoE 'pam_[A-Za-z0-9_]+\.so' /etc/pam.d/ | sort | uniq -c
     echo "### pam_exec / pam_script lines"; grep -rnE 'pam_exec|pam_script' /etc/pam.d/
-    echo "### unpackaged PAM modules"; for m in /lib/x86_64-linux-gnu/security/*.so; do dpkg -S "$m" >/dev/null 2>&1 || echo "UNPACKAGED $m"; done
+    echo "### unpackaged PAM modules"; for m in /lib/x86_64-linux-gnu/security/*.so; do owned "$m" || echo "UNPACKAGED $m"; done
     echo "### roundcube"; ls -la /opt/roundcube /opt/roundcube/plugins 2>/dev/null; grep -E "db_dsnw|des_key|plugins|enable_installer" /opt/roundcube/config/config.inc.php 2>/dev/null
     echo "### disk";      df -h; du -xsh /var/log /var/mail /var/spool/postfix /snap /var/lib/snapd /home 2>/dev/null
     echo "### procs";     ps auxf
@@ -149,9 +160,9 @@ cmd_backup() {
   find /opt/roundcube /etc/postfix /etc/dovecot /etc/apache2 /etc/pam.d /etc/ssh /usr/lib/apache2/modules -type f -not -path '*/temp/*' -not -path '*/logs/*' -exec sha256sum {} + 2>/dev/null > "$D/baseline.sha256"
   ss -tlnH | awk '{print $4}' | sort -u > "$D/baseline.ports"
   awk -F: '{print $1":"$3":"$7}' /etc/passwd | sort > "$D/baseline.passwd"
-  cp -a "$dir" /root/.cache-bk 2>/dev/null; cp -a "$dir"/. /root/.cache-bk/ 2>/dev/null
+  mkdir -p /root/.cache-bk; cp -a "$dir"/etc.tgz "$dir"/roundcube.tgz /root/.cache-bk/ 2>/dev/null
   ok "baseline hashes: $D/baseline.sha256 ($(wc -l <"$D/baseline.sha256") files)"
-  ok "second copy: /root/.cache-bk/"
+  ok "second copy of configs + roundcube: /root/.cache-bk/"
   echo "$dir" >> "$D/backup.list"
   note "backup -> $dir"
   say "Tip: also copy etc.tgz + roundcube.tgz OFF the box (scp to the Ubuntu workstation) if you can."
@@ -180,6 +191,7 @@ cmd_evict() {
   for k in /root/.ssh/authorized_keys* /home/*/.ssh/authorized_keys* /etc/ssh/.ssh/authorized_keys*; do
     [ -s "$k" ] || continue
     bad "$k:"; awk '{print "     "$1" ..."substr($2,length($2)-12)" "$3}' "$k"
+    tip "These keys let someone log in with no password. Say y unless YOU put this key there (last time: kali@transistor = red team)."
     if ask "Quarantine $k (removes all keys in it)?"; then quar "$k"; fi
   done
   # 2. sshd AuthorizedKeysFile redirection
@@ -190,8 +202,9 @@ cmd_evict() {
     local so; so=$(awk '/LoadModule/{print $3}' "$m" 2>/dev/null)
     [ -n "$so" ] || continue
     [[ $so != /* ]] && so="/usr/lib/apache2/$so"
-    if [ -f "$so" ] && ! dpkg -S "$so" >/dev/null 2>&1; then
+    if [ -f "$so" ] && ! owned "$so"; then
       found=1; bad "Apache module NOT from any package: $m -> $so"
+      tip "Real Apache modules always come from packages. Last time a fake one (coraza) was a backdoor. Say y."
       if ask "Disable and quarantine it?"; then
         local name; name=$(basename "$m" .load)
         a2dismod -f "$name" >/dev/null 2>&1; quar "$so"; quar "/etc/apache2/mods-available/$name.load"; quar "/etc/apache2/mods-available/$name.conf"
@@ -199,24 +212,25 @@ cmd_evict() {
       fi
     fi
   done
-  [ $found = 0 ] && ok "all enabled Apache modules belong to packages"
+  [ $found = 0 ] && ok "all enabled Apache modules belong to packages (good)"
   # 4. systemd units not owned by packages
   local u
   for u in /etc/systemd/system/*.service /lib/systemd/system/*.service; do
     [ -f "$u" ] || continue; [ -L "$u" ] && continue
-    dpkg -S "$u" >/dev/null 2>&1 && continue
+    owned "$u" && continue
     local ex; ex=$(grep -m1 '^ExecStart' "$u" | cut -d= -f2-)
     warn "unpackaged unit: $u"; echo "     $(grep -m1 '^Description' "$u")"; echo "     ExecStart=$ex"
-    case "$(basename "$u")" in snap*|cloud*|sssd*|splunk*|SplunkForwarder*) continue;; esac
+    case "$(basename "$u")" in snap*|cloud*|sssd*|splunk*|Splunk*) tip "known-good ($(basename "$u")), skipping"; continue;; esac
+    tip "A service that no package installed. Say y if it isn't something your team added (Splunk/SSSD are skipped automatically). Red team names look like OS daemons: net-pathd, rt-tagd, irqbalance-daemon."
     if ask "Stop, disable and quarantine $(basename "$u") and its binary?"; then
       local svc; svc=$(basename "$u"); systemctl disable --now "$svc" 2>/dev/null; note "disabled $svc"
       local bin; bin=$(echo "$ex" | awk '{print $1}' | sed 's/^[-@+!]*//')
-      [ -f "$bin" ] && ! dpkg -S "$bin" >/dev/null 2>&1 && quar "$bin"
+      [ -f "$bin" ] && ! owned "$bin" && quar "$bin"
       quar "$u"; systemctl daemon-reload
     fi
   done
   # 4b. PAM backdoors (credential stealers like 'pamspam' on Splunk last time)
-  local m2; for m2 in /lib/x86_64-linux-gnu/security/*.so; do dpkg -S "$m2" >/dev/null 2>&1 || { bad "UNPACKAGED PAM module: $m2"; grep -rln "$(basename "$m2")" /etc/pam.d/ | sed 's/^/     used in: /'; warn "     fix: remove its line from those /etc/pam.d files (bk first), then quarantine the .so"; }; done
+  local m2; for m2 in /lib/x86_64-linux-gnu/security/*.so; do owned "$m2" || { bad "UNPACKAGED PAM module: $m2"; grep -rln "$(basename "$m2")" /etc/pam.d/ | sed 's/^/     used in: /'; warn "     fix: remove its line from those /etc/pam.d files (bk first), then quarantine the .so"; }; done
   grep -rnE 'pam_exec|pam_script' /etc/pam.d/ && bad "^ pam_exec lines above run a program on every login - inspect"
   # 5. ld.so.preload
   grep -q . /etc/ld.so.preload 2>/dev/null && { bad "/etc/ld.so.preload: $(cat /etc/ld.so.preload)"; ask "Quarantine /etc/ld.so.preload?" && quar /etc/ld.so.preload; }
@@ -231,26 +245,78 @@ cmd_evict() {
 }
 
 # =============================== passwd ===============================
+# Seed-phrase passwords: byte-for-byte the same algorithm as BYU zulu.sh, so the team can
+# re-derive any password with zulu.sh -g (or: bash ccmail.sh seedshow <user>).
+WORDLIST_URLS="https://raw.githubusercontent.com/BYU-CCDC/public-ccdc-resources/main/windows/hardening/wordlist.txt https://raw.githubusercontent.com/DrSchnitzel57/mail-tools/main/wordlist.txt"
+WL=$D/wordlist.txt
+get_wordlist() {
+  [ -s "$WL" ] && return 0
+  local u; for u in /root/wordlist.txt ./wordlist.txt; do [ -s "$u" ] && { tr -d '\r' < "$u" > "$WL"; return 0; }; done
+  for u in $WORDLIST_URLS; do
+    { wget -qO- "$u" 2>/dev/null || curl -fsSL "$u" 2>/dev/null; } | tr -d '\r' > "$WL.tmp"
+    [ "$(wc -l < "$WL.tmp")" -gt 1000 ] && { mv "$WL.tmp" "$WL"; ok "wordlist downloaded ($(wc -l < "$WL") words)"; return 0; }
+  done
+  rm -f "$WL.tmp"; bad "couldn't get the zulu wordlist (no internet?). Put wordlist.txt in /root/ and re-run: bash $0 passwd"; return 1
+}
+zulu_pw() {  # zulu_pw <seed> <user>  -> prints password (5 words-1)
+  local hash i hex dec idx pw="" b; hash=$(echo -n "$1$2" | md5sum); b=$(wc -l "$WL" | awk '{print $1-1}')
+  for i in 0 4 8 12 16; do
+    hex=${hash:$i:4}; dec=$((16#$hex))
+    idx=$(awk -v x="$dec" -v b="$b" 'BEGIN{printf(int((0+((x-0)*(b-0))/(65535-0))))}')
+    [ $i -ne 0 ] && pw+="-"; pw+=$(sed -n "$((idx+1))p" "$WL")
+  done; echo "${pw}1"
+}
+read_seed() {  # sets SEED
+  local a b2
+  while true; do
+    read -r -s -p "  Team seed phrase (same one you use with zulu): " a; echo
+    read -r -s -p "  Confirm seed phrase: " b2; echo
+    [ "$a" != "$b2" ] && { warn "didn't match, try again"; continue; }
+    [ ${#a} -lt 8 ] && { warn "zulu requires at least 8 characters, try again"; continue; }
+    SEED=$a; break
+  done
+}
+set_pw_manual() {  # set_pw_manual <user>
+  local p1 p2
+  while true; do
+    read -r -s -p "  New password for $1 (Enter = skip): " p1; echo
+    [ -z "$p1" ] && { say "skipped $1"; return; }
+    read -r -s -p "  Again: " p2; echo
+    [ "$p1" = "$p2" ] && break; warn "didn't match, try again"
+  done
+  echo "$1:$p1" | chpasswd && ok "changed $1" && note "password changed: $1"
+}
 cmd_passwd() {
-  hdr "PASSWORDS"
-  id ccdcuser1 >/dev/null 2>&1 || { ask "Create backup admin ccdcuser1?" && { useradd -m -s /bin/bash ccdcuser1 && usermod -aG sudo ccdcuser1 && note "created ccdcuser1 (sudo)"; }; }
-  local u p1 p2
-  for u in $ADMIN_USERS; do
-    id "$u" >/dev/null 2>&1 || continue
-    read -r -s -p "New password for $u (blank = skip): " p1; echo
-    [ -z "$p1" ] && continue
-    read -r -s -p "Again: " p2; echo
-    [ "$p1" = "$p2" ] || { bad "mismatch, skipped $u"; continue; }
-    echo "$u:$p1" | chpasswd && ok "changed $u" && note "password changed: $u"
-  done
-  # lock other LOCAL accounts that have a login shell (AD users are not in /etc/passwd, unaffected)
-  awk -F: '$7!~/(nologin|false|sync)$/{print $1}' /etc/passwd | while read -r x; do
-    case " $ADMIN_USERS " in *" $x "*) continue;; esac
-    warn "local login user: $x"
-    ask "Lock $x (passwd -l + nologin shell)?" < /dev/tty && { usermod -L -s /usr/sbin/nologin "$x" && note "locked $x"; }
-  done
-  say "Remove anyone from sudo who shouldn't be there:  gpasswd -d <user> sudo"
-  say "Scored mail users are AD accounts -> their passwords are changed on the DC + PCR in Quotient (coordinate with the AD person)."
+  hdr "PASSWORDS (zulu-compatible)"
+  tip "Same as zulu -i: you type passwords for root, ccdcuser1, ccdcuser2. Every OTHER local login user (like sysadmin) gets a seed-phrase password."
+  tip "Nothing shows while you type. Enter on an empty prompt skips that account."
+  local u
+  for u in ccdcuser1 ccdcuser2; do id "$u" >/dev/null 2>&1 || { useradd -m -s /bin/bash "$u" && ok "created $u" && note "created $u"; }; done
+  usermod -aG sudo ccdcuser1 && ok "ccdcuser1 is in sudo (ccdcuser2 is a normal user, like zulu)"
+  for u in root ccdcuser1 ccdcuser2; do set_pw_manual "$u"; done
+  # everyone else with a login shell, exactly like zulu's user list (excludes root, ccdcuser1, ccdcuser2)
+  local users; users=$(grep -v "false\|nologin" /etc/passwd | cut -d: -f1 | grep -vxE 'root|ccdcuser1|ccdcuser2')
+  echo; say "Other local login users: $(echo $users)"
+  if [ -n "$users" ] && ask "Give them seed-phrase passwords (team zulu scheme)?" < /dev/tty && get_wordlist; then
+    read_seed < /dev/tty
+    for u in $users; do
+      echo "$u:$(zulu_pw "$SEED" "$u")" | chpasswd && ok "seed password set: $u" && note "seed password set: $u"
+    done
+    tip "sysadmin's password is now the SEED one, not what you typed by hand at minute 1."
+    tip "To see any of them later:  bash $0 seedshow sysadmin     (or zulu.sh -g -u sysadmin on your laptop)"
+    unset SEED
+  elif [ -n "$users" ]; then
+    say "No seed: set passwords by hand instead."
+    for u in $users; do set_pw_manual "$u"; done
+  fi
+  say "Check sudo members: $(getent group sudo | cut -d: -f4)   (remove extras: gpasswd -d <user> sudo)"
+  say "Scored mail users are AD accounts -> changed on the DC + PCR in Quotient (Savannah)."
+  say "If SSH is scored with sysadmin and goes red after this: submit a PCR in Quotient with sysadmin's new password."
+}
+cmd_seedshow() {  # print the seed password for one or more users (doesn't change anything)
+  [ -n "$2" ] || { echo "usage: bash $0 seedshow <user> [user...]"; return 1; }
+  get_wordlist || return 1; read_seed; shift
+  local u; for u in "$@"; do echo "  $u : $(zulu_pw "$SEED" "$u")"; done; unset SEED
 }
 
 # =============================== sshd ===============================
@@ -289,7 +355,10 @@ cmd_fw() {
   hdr "FIREWALL (iptables)"
   have iptables || apt-get install -y iptables
   have ufw && ufw status 2>/dev/null | grep -q active && { ufw disable; note "ufw disabled"; }
+  local pre_sql=0 pre_ad=0; port_up "$SQL_IP" 1433 && pre_sql=1; port_up "$DC_IP" 389 && pre_ad=1
+  say "before firewall: MSSQL 1433 $([ $pre_sql = 1 ] && echo reachable || echo NOT reachable), AD 389 $([ $pre_ad = 1 ] && echo reachable || echo NOT reachable)"
   local save="$BAK/iptables.$(TS)"; iptables-save > "$save"; ok "old rules saved: $save"
+  tip "Applying rules now. Your console session won't drop. A 90-second safety timer will UNDO everything unless you confirm below."
   # dead-man switch: auto-rollback in 90s unless confirmed
   setsid bash -c "sleep 90; iptables-restore < '$save'; iptables -P INPUT ACCEPT; iptables -P OUTPUT ACCEPT; echo 'ccmail: firewall ROLLED BACK' | wall" >/dev/null 2>&1 &
   local rb=$!
@@ -327,11 +396,19 @@ cmd_fw() {
     ip6tables -A INPUT -p ipv6-icmp -j ACCEPT; ip6tables -A OUTPUT -p ipv6-icmp -j ACCEPT
     ip6tables -P INPUT DROP; ip6tables -P FORWARD DROP; ip6tables -P OUTPUT DROP
   fi
-  ok "rules applied. Quick self-test:"
-  port_up "$DC_IP" 389  && ok "  AD LDAP 389 reachable"  || bad "  AD LDAP 389 NOT reachable"
-  port_up "$SQL_IP" 1433 && ok "  MSSQL 1433 reachable"   || bad "  MSSQL 1433 NOT reachable (Roundcube login will fail)"
+  ok "rules applied. Self-test (after firewall):"
+  local post_sql=0 post_ad=0; port_up "$SQL_IP" 1433 && post_sql=1; port_up "$DC_IP" 389 && post_ad=1
+  [ $post_sql = 1 ] && ok "  MSSQL 1433 reachable" || bad "  MSSQL 1433 NOT reachable"
+  [ $post_ad = 1 ]  && ok "  AD LDAP 389 reachable" || bad "  AD LDAP 389 NOT reachable"
   getent hosts dc.underpressure.local >/dev/null && ok "  DNS works" || warn "  DNS lookup of dc.underpressure.local failed"
-  local a=""; read -r -t 80 -p "${Y}Still have access and the checks look OK? type 'yes' within 80s or it rolls back: ${N}" a
+  if [ $pre_sql -gt $post_sql ] || [ $pre_ad -gt $post_ad ]; then
+    bad "  The firewall BROKE something that worked before. Type no (it undoes). Then check IPs at the top of the script."
+  elif [ $post_sql = 1 ] && [ $post_ad = 1 ]; then
+    ok "  Everything that worked before still works. ${G}Type yes.${N}"
+  else
+    warn "  Something was ALREADY unreachable before your firewall, so it's not your rules. ${Y}Type yes${N}, then tell Ben (MSSQL) / Savannah (AD) / Ava (Palo)."
+  fi
+  local a=""; read -r -t 80 -p "${Y}Type yes to keep the firewall (80s, anything else = undo): ${N}" a
   if [ "$a" = yes ]; then
     kill "$rb" 2>/dev/null; pkill -f "sleep 90; iptables-restore" 2>/dev/null
     mkdir -p /etc/iptables; iptables-save > /etc/iptables/rules.v4; have ip6tables && ip6tables-save > /etc/iptables/rules.v6
@@ -354,6 +431,7 @@ cmd_fwoff() {
 
 # =============================== mail hardening ===============================
 cmd_mail() {
+  tip "Each fix asks first and validates the config before reloading. Red lines = something an attacker may have added."
   hdr "POSTFIX"
   if have postconf; then
     bk /etc/postfix/main.cf; bk /etc/postfix/master.cf
@@ -410,6 +488,7 @@ cmd_mail() {
 # =============================== hunt ===============================
 cmd_hunt() {
   hdr "HUNT $(date '+%H:%M:%S')"
+  tip "Read only the RED lines. Each one is something new since your baseline. If YOU caused it, run: bash $0 rebase"
   say "who is logged in:"; who; w -h | awk '{print "   "$1, $2, $3, $NF}' | head
   say "established connections (non-LAN peers flagged):"
   ss -tnpH state established | while read -r _ _ l r p; do
@@ -424,11 +503,11 @@ cmd_hunt() {
     [ -n "$newu" ] && bad "NEW/CHANGED users: $newu"
   fi
   awk -F: '$3==0 && $1!="root"' /etc/passwd | grep . && bad "extra UID 0 account!"
-  local pm; for pm in /lib/x86_64-linux-gnu/security/*.so; do dpkg -S "$pm" >/dev/null 2>&1 || bad "unpackaged PAM module: $pm"; done
+  local pm; for pm in /lib/x86_64-linux-gnu/security/*.so; do owned "$pm" || bad "unpackaged PAM module: $pm"; done
   ls /root/.config/systemd/user /home/*/.config/systemd/user 2>/dev/null | grep -q . && bad "user-level systemd units exist: ls /root/.config/systemd/user /home/*/.config/systemd/user"
   local k; for k in /root/.ssh/authorized_keys* /home/*/.ssh/authorized_keys* /etc/ssh/.ssh/*; do [ -s "$k" ] && bad "authorized_keys exists: $k"; done
   grep -q . /etc/ld.so.preload 2>/dev/null && bad "/etc/ld.so.preload populated"
-  local f; for f in /etc/systemd/system/*.service /etc/systemd/system/*.timer; do [ -f "$f" ] && ! dpkg -S "$f" >/dev/null 2>&1 && [ "$f" -nt "$D/baseline.ports" ] 2>/dev/null && bad "unit created after baseline: $f"; done
+  local f; for f in /etc/systemd/system/*.service /etc/systemd/system/*.timer; do [ -f "$f" ] && ! owned "$f" && [ "$f" -nt "$D/baseline.ports" ] 2>/dev/null && bad "unit created after baseline: $f"; done
   say "crontabs modified in last 60 min:"; find /etc/cron* /var/spool/cron -type f -mmin -60 2>/dev/null | sed 's/^/   /'
   say "files changed in last 20 min (etc, roundcube, bins, tmp):"
   find /etc /opt/roundcube /usr/bin /usr/sbin /usr/lib/apache2 /tmp /var/tmp /dev/shm /root /home -xdev -type f -mmin -20 2>/dev/null | grep -vE '/opt/roundcube/(temp|logs)/|/root/ccdc/|\.bash_history$|/\.cache/' | head -30 | sed 's/^/   /'
@@ -449,6 +528,7 @@ cmd_hunt() {
 # =============================== check ===============================
 cmd_check() {
   hdr "SCORING HEALTH $(date '+%H:%M:%S')"
+  tip "Green [+] = good. Red [X] = fix it (see 'Something's broken' in the guide). Yellow [!] = check, may be fine."
   local s
   for s in postfix dovecot apache2 sssd ssh; do
     systemctl is-active --quiet "$s" && ok "$s active" || bad "$s NOT active -> systemctl restart $s ; journalctl -u $s -n 30"
@@ -485,12 +565,36 @@ cmd_rebase() {   # accept current state as the new known-good baseline (after YO
 
 # =============================== first ===============================
 cmd_first() {
-  hdr "DROP-FLAG SEQUENCE"
-  cmd_passwd; cmd_evict; cmd_sshd; cmd_disk; cmd_backup; cmd_recon; cmd_fw; cmd_check
-  ok "First pass done. Next: 'ccmail.sh mail', then 'ccmail.sh hunt' every 15-20 min. Change log: $LOG"
+  hdr "DROP-FLAG SEQUENCE: 8 steps, about 5-8 minutes"
+  echo "  Every change is backed up first. Nothing is deleted (suspicious files go to $Q)."
+  echo "  Ctrl-C at any prompt stops safely. You can re-run any single step later, e.g.  bash $0 fw"
+  stage 1 "Passwords (zulu-compatible)" "creates ccdcuser1+2; you set root/ccdcuser1/ccdcuser2; everyone else gets the team seed-phrase password" "3 passwords, then y + the seed phrase twice"
+  cmd_passwd
+  stage 2 "Evict backdoors" "find planted SSH keys, fake services/modules, PAM stealers" "y to quarantine anything flagged that your team didn't add"
+  cmd_evict
+  stage 3 "Harden SSH" "no root login, 3 tries, no tunnels; passwords stay on for the scorer" "nothing (automatic)"
+  cmd_sshd
+  stage 4 "Free disk space" "logs, apt cache, old snaps (disk starts ~96% full)" "y to remove the PowerShell snap"
+  cmd_disk
+  stage 5 "Backups" "configs + Roundcube (+ mail if it fits) and a fingerprint of every config file" "nothing (automatic)"
+  cmd_backup
+  stage 6 "Recon" "snapshot of users, ports, services into a file for injects/IR" "nothing (automatic)"
+  cmd_recon
+  stage 7 "Firewall" "allow mail/web/ssh in; only DNS/AD/MSSQL/Splunk/web out; auto-undo in 90s" "type yes if MSSQL + AD say reachable"
+  cmd_fw
+  stage 8 "Health check" "tests every scored service and dependency" "nothing - read the red lines"
+  cmd_check
+  hdr "DONE - SUMMARY"
+  echo "  What changed (from $LOG):"; sed 's/^/    /' "$LOG" | tail -25
+  echo "  Quarantined files: $(ls "$Q" 2>/dev/null | wc -l)  (in $Q - tell your Injects lead for an incident report)"
+  echo
+  ok "Next:  bash $0 mail     (mail-service hardening, ~2 min)"
+  ok "Then:  bash $0 hunt; bash $0 check     every 15 minutes"
+  ok "Broken?  bash $0 fwoff  (if you suspect the firewall)   |   bash $0 restore  (restore configs)"
 }
 
 case "$1" in
   first|recon|disk|backup|restore|evict|passwd|sshd|fw|fwoff|mail|hunt|check|rebase) "cmd_$1" ;;
-  *) sed -n '2,25p' "$0" ;;
+  seedshow) cmd_seedshow "$@" ;;
+  *) sed -n '2,27p' "$0"; echo; echo "  ${G}Start here:  bash $0 first${N}" ;;
 esac
