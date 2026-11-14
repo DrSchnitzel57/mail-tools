@@ -19,6 +19,7 @@
 #    disk     free disk space (root fs starts ~96% full)
 #    restore  list backups and show restore commands
 #    rebase   accept current configs as the new baseline (after your own changes)
+#    sqlpass  after Ben changes the roundcube SQL password: test it, update Roundcube, verify, undo if broken
 #
 #  Every change backs the file up to /root/ccdc/bak/ first. Nothing is deleted:
 #  suspicious files are moved to /root/ccdc/quarantine/ for incident reports.
@@ -485,6 +486,71 @@ cmd_mail() {
   fi
 }
 
+# =============================== sqlpass ===============================
+cmd_sqlpass() {  # update Roundcube after Ben changes the 'roundcube' SQL login password on MSSQL
+  hdr "ROUNDCUBE DATABASE PASSWORD"
+  local CF=/opt/roundcube/config/config.inc.php
+  [ -f "$CF" ] || { bad "$CF not found"; return 1; }
+  local info; info=$(CF="$CF" python3 - <<'PY'
+import os,re
+s=open(os.environ['CF']).read()
+m=re.search(r"\$config\['db_dsnw'\]\s*=\s*'([^']*)'",s)
+if not m: print("NONE"); raise SystemExit
+v=m.group(1); scheme,rest=v.split('://',1); cred,hp=rest.rsplit('@',1)
+user=cred.split(':',1)[0]; host,_,db=hp.partition('/'); h,_,port=host.partition(':')
+print(scheme,user,h,port or '1433',db)
+PY
+)
+  [ "$info" = NONE ] || [ -z "$info" ] && { bad "couldn't find the db_dsnw line in $CF - edit it by hand (see guide)"; return 1; }
+  local scheme user host port db; read -r scheme user host port db <<<"$info"
+  say "Roundcube connects as SQL login '${user}' to ${host}:${port}, database '${db}'"
+  tip "Do this right AFTER Ben runs ALTER LOGIN on MSSQL. Webmail is down between his change and yours, so be quick."
+  tip "Ben should send the new password privately. Letters, numbers and dashes are easiest; other characters are encoded for you."
+  local p1 p2
+  while true; do
+    read -r -s -p "  New password for SQL login '$user': " p1; echo
+    [ -z "$p1" ] && { say "cancelled"; return 1; }
+    read -r -s -p "  Again: " p2; echo
+    [ "$p1" = "$p2" ] && break; warn "didn't match, try again"
+  done
+  # 1. test the password before touching anything
+  if have php && php -m 2>/dev/null | grep -qi pdo_sqlsrv; then
+    local r; r=$(S="$host,$port" D="$db" U="$user" P="$p1" php -r 'try{new PDO("sqlsrv:Server=".getenv("S").";Database=".getenv("D"),getenv("U"),getenv("P"));echo "OK";}catch(Exception $e){echo "FAIL: ".$e->getMessage();}' 2>&1)
+    if [[ $r == OK* ]]; then ok "test login to MSSQL with the new password WORKED"
+    else bad "test login FAILED: $r"
+      tip "Login failed = wrong password, or Ben hasn't changed it yet, or login locked. Firewall/encryption errors = not the password."
+      ask "Apply the new password anyway?" || return 1
+    fi
+  else warn "can't pre-test (php pdo_sqlsrv CLI missing) - will check the webmail page right after"; fi
+  # 2. back up + edit just the password inside db_dsnw (URL-encoded, like Roundcube expects)
+  bk "$CF"; local saved; saved=$(ls -t "$BAK/opt/roundcube/config/"config.inc.php.* | head -1)
+  CF="$CF" P="$p1" python3 - <<'PY' || { bad "edit failed - config untouched"; return 1; }
+import os,re,urllib.parse
+p=os.environ['CF']; enc=urllib.parse.quote(os.environ['P'],safe='')
+s=open(p).read()
+def fix(m):
+    scheme,rest=m.group(2).split('://',1); cred,hp=rest.rsplit('@',1); user=cred.split(':',1)[0]
+    return m.group(1)+scheme+'://'+user+':'+enc+'@'+hp+m.group(3)
+s2,n=re.subn(r"(\$config\['db_dsnw'\]\s*=\s*')([^']*)(';)",fix,s,count=1)
+assert n==1
+open(p,'w').write(s2)
+PY
+  unset p1 p2
+  if have php && ! php -l "$CF" >/dev/null 2>&1; then bad "config has a PHP syntax error - restoring"; cp -a "$saved" "$CF"; return 1; fi
+  ok "config updated (backup: $saved)"; note "roundcube db_dsnw password updated (backup $saved)"
+  # 3. reload so PHP picks it up
+  systemctl reload apache2 2>/dev/null; systemctl reload 'php*-fpm.service' 2>/dev/null; sleep 2
+  # 4. verify the web page
+  local page; page=$(curl -sk -m 8 https://127.0.0.1/ 2>/dev/null)
+  if echo "$page" | grep -qiE 'DATABASE ERROR|DB Error|connection failed'; then
+    bad "webmail shows a DATABASE ERROR with the new password"
+    if ask "Put the OLD config back?"; then cp -a "$saved" "$CF"; systemctl reload apache2; warn "restored old config"; note "roundcube db password change ROLLED BACK"; fi
+  elif echo "$page" | grep -qi roundcube; then ok "webmail login page loads with no database error"
+    tip "Best final test: log in to webmail in a browser from the Ubuntu workstation (https://172.20.240.15)."
+  else warn "page didn't look like Roundcube - check: curl -vk https://127.0.0.1/ and the 'Webmail' fix steps"; fi
+  cmd_rebase >/dev/null; ok "baseline refreshed so hunt won't flag this change"
+}
+
 # =============================== hunt ===============================
 cmd_hunt() {
   hdr "HUNT $(date '+%H:%M:%S')"
@@ -594,7 +660,7 @@ cmd_first() {
 }
 
 case "$1" in
-  first|recon|disk|backup|restore|evict|passwd|sshd|fw|fwoff|mail|hunt|check|rebase) "cmd_$1" ;;
+  first|recon|disk|backup|restore|evict|passwd|sshd|fw|fwoff|mail|hunt|check|rebase|sqlpass) "cmd_$1" ;;
   seedshow) cmd_seedshow "$@" ;;
-  *) sed -n '2,27p' "$0"; echo; echo "  ${G}Start here:  bash $0 first${N}" ;;
+  *) sed -n '2,28p' "$0"; echo; echo "  ${G}Start here:  bash $0 first${N}" ;;
 esac
