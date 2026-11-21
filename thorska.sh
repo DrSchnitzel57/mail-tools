@@ -14,13 +14,13 @@
 #  bash thorska.sh fw [learn|lock|status|off]   host firewall (nftables)
 #  bash thorska.sh backup     disguised backup of configs + app + database
 #  bash thorska.sh restore [what]               restore one piece from backup
-#  bash thorska.sh evict | passwd | ssh | recon | report | rebase
+#  bash thorska.sh evict | docker | db | passwd | ssh | recon | report | rebase
 #  bash thorska.sh seedshow <user...> [--csv]   show seed passwords (zulu-compatible)
 #
 #  Ctrl-C during a step = pause menu (skip / retry / quit). Nothing is ever deleted:
 #  suspicious files are moved to /root/tk/quarantine/. Every change is logged.
 # ======================================================================
-VERSION="1.1"
+VERSION="1.3"
 
 # ---------------------- EDIT IF THE ENVIRONMENT CHANGED ----------------------
 LAN="192.168.220.0/24"
@@ -331,9 +331,143 @@ cmd_evict() {
   find / -xdev -perm -4000 -type f 2>/dev/null | while read -r f; do owned "$f" || echo "$f"; done > "$D/.suid"
   while read -r f; do [ -n "$f" ] && plan_add "remove SUID bit from $f" "chmod u-s $(q "$f")"; done < "$D/.suid"
 
+  docker_audit
+
   plan_apply
   tip "Write down what you quarantined + the time: your team needs it for an incident report."
   note "evict run"
+}
+
+# ======================================================================
+#  DOCKER / PODMAN  (part of evict; alone: bash thorska.sh docker)
+# ======================================================================
+cmd_docker() { hdr "DOCKER / PODMAN"; plan_reset; docker_audit; plan_apply; }
+docker_audit() {
+  sub "Docker / Podman"
+  tip "Read-only checks first. Stopping a container is always 'pick by number only' (it could be the web app or its database)."
+  local cr g u pm n ports st img priv net pid rp mnt cmd cap why any=0 home
+  if have docker || [ -S /var/run/docker.sock ] || [ -d /etc/docker ]; then any=1
+    g=$(getent group docker | cut -d: -f4)
+    if [ -n "$g" ]; then bad "group docker = root without a password. Members: ${BO}${g//,/ }${N}"
+      for u in ${g//,/ }; do
+        if [ "$u" = "${SUDO_USER:-}" ] || who 2>/dev/null | awk '{print $1}' | grep -qx "$u"; then plan_add "remove $u from group docker (root-equivalent) ${R}(logged in now)${N}" "gpasswd -d $(q "$u") docker" risky
+        else plan_add "remove $u from group docker (root-equivalent)" "gpasswd -d $(q "$u") docker"; fi; done
+    else ok "group docker has no members"; fi
+    if [ -S /var/run/docker.sock ]; then pm=$(stat -c '%a %U:%G' /var/run/docker.sock 2>/dev/null)
+      case "$pm" in [0-7][0-7]0\ *) ok "docker.sock is root/docker only ($pm)";; *) bad "docker.sock is open to every user ($pm) = anyone can get root"; plan_add "make docker.sock root/docker only (chmod 660)" "chmod 660 /var/run/docker.sock";; esac; fi
+    if ss -Htln 2>/dev/null | awk '{print $4}' | grep -qE ':(2375|2376)$' || pgrep -af dockerd 2>/dev/null | grep -q 'tcp://' || grep -qs 'tcp://' /etc/docker/daemon.json /etc/systemd/system/docker.service.d/*.conf /etc/sysconfig/docker; then
+      bad "Docker API is open on the network (tcp 2375/2376) = anyone who reaches it gets root"
+      tip "the firewall step blocks 2375/2376 inbound. Full fix (restarts Docker, so containers restart): remove the tcp:// host from /etc/docker/daemon.json or the docker.service drop-in, then systemctl restart docker"
+    else ok "Docker API is not open on the network"; fi
+  fi
+  for cr in docker podman; do have $cr || continue; any=1
+    if ! timeout 15 $cr ps -a --format '{{.Names}}|{{.Ports}}' > "$D/.ctr" 2>/dev/null; then warn "$cr didn't answer (service stopped?)  check: systemctl status $cr"; continue; fi
+    [ -s "$D/.ctr" ] || { ok "$cr: no containers"; continue; }
+    say "$cr containers (all, running or not):"
+    while IFS='|' read -r n ports; do [ -n "$n" ] || continue
+      IFS='|' read -r st img priv net pid rp mnt cmd cap < <(timeout 10 $cr inspect -f '{{.State.Status}}|{{.Config.Image}}|{{.HostConfig.Privileged}}|{{.HostConfig.NetworkMode}}|{{.HostConfig.PidMode}}|{{.HostConfig.RestartPolicy.Name}}|{{range .Mounts}}{{.Source}}:{{.Destination}} {{end}}|{{.Config.Cmd}}|{{.HostConfig.CapAdd}}' "$n" 2>/dev/null | tr '\n' ' ')
+      why=""
+      [ "$priv" = true ] && why+=" privileged(full host root)"
+      case " $mnt" in *docker.sock*|*podman.sock*) why+=" has-the-Docker-socket(controls the host)";; esac
+      case " $mnt" in *" /:"*|*" /etc:"*|*" /root:"*|*" /home:"*|*" /boot:"*) why+=" mounts-host-system-folders";; esac
+      [ "$pid" = host ] && why+=" sees-host-processes"
+      case "$cap" in *SYS_ADMIN*|*ALL*|*SYS_PTRACE*|*SYS_MODULE*) why+=" extra-powers($cap)";; esac
+      echo "$cmd" | grep -qE '\bnc\b|ncat|socat|/dev/tcp|bash -i|sh -i|(curl|wget).*\|' && why+=" runs-a-shell/downloader($cmd)"
+      echo "      ${BO}$n${N}  $img  [$st]  ports: ${ports:-none}  net: $net  restart: ${rp:-no}"
+      [ -n "$mnt" ] && echo "         folders: $mnt"
+      if [ -n "$why" ]; then bad "container $n looks dangerous:$why"
+        if [ "$cr" = docker ]; then plan_add "stop container $n and keep it from restarting ($img)" "docker update --restart=no $(q "$n") >/dev/null 2>&1; docker stop -t 5 $(q "$n")" risky
+        else plan_add "stop container $n ($img)" "podman stop -t 5 $(q "$n")" risky; fi
+      elif [ -n "$ports" ]; then say "   ^ publishes ports: probably the app (or its database). Leave it running."; fi
+    done < "$D/.ctr"
+    grep -q . "$D/.ctr" && tip "ports a container publishes go through $cr's own firewall rules, not this script's: they stay open, and 'fw lock' doesn't limit what containers connect to"
+  done
+  for home in /root /home/*; do [ -d "$home/.local/share/containers/storage" ] || continue; any=1
+    u=$(stat -c %U "$home" 2>/dev/null); [ "$u" = root ] && [ "$home" != /root ] && continue
+    [ "$home" = /root ] && continue
+    warn "user ${BO}$u${N} has their own Podman containers (not in the list above). Look:  sudo -u $u podman ps -a"; done
+  [ "$any" = 0 ] && ok "no Docker or Podman on this box"
+  return 0
+}
+
+# ======================================================================
+#  DATABASE AUDIT  (part of protect; alone: bash thorska.sh db)
+# ======================================================================
+cmd_db() { hdr "DATABASE AUDIT"; plan_reset; db_audit; plan_apply; }
+dbx() { timeout 15 mysql -N -B -e "$1"; }          # used by plan commands
+dbq() { timeout 15 mysql -N -B -e "$1" 2>/dev/null; }
+sqs() { printf "%s" "$1" | sed "s/'/''/g"; }        # escape for '...' in SQL
+db_rootpw() {   # set a new password for the database root, keeping root's no-password socket login on MariaDB
+  local p1 p2
+  read -r -s -p "  New database root password: " p1 </dev/tty; echo; read -r -s -p "  Again: " p2 </dev/tty; echo
+  [ -n "$p1" ] && [ "$p1" = "$p2" ] || { warn "empty or didn't match - not changed"; return 1; }
+  if dbq "select version()" | grep -qi mariadb; then dbx "ALTER USER 'root'@'localhost' IDENTIFIED VIA unix_socket OR mysql_native_password USING PASSWORD('$(sqs "$p1")'); FLUSH PRIVILEGES;"
+  else dbx "ALTER USER 'root'@'localhost' IDENTIFIED BY '$(sqs "$p1")'; FLUSH PRIVILEGES;" && printf '[client]\nuser=root\npassword="%s"\n' "$p1" > /root/.my.cnf && chmod 600 /root/.my.cnf; fi
+  tip "write it down for the team. Scored checks don't normally log in as the database root."
+}
+db_audit() {
+  sub "Database (MySQL / MariaDB)"
+  if ! pgrep -x mariadbd >/dev/null && ! pgrep -x mysqld >/dev/null; then
+    if [ -s "$W/dbtargets" ]; then say "no database server on this box. The app's database is on ${BO}$(tr '\n' ' ' < "$W/dbtargets")${N}: tell whoever owns that box to check users, UDFs, FILE privilege and secure_file_priv."
+    else ok "no MySQL/MariaDB server on this box"; fi
+    pgrep -x postgres >/dev/null && warn "PostgreSQL is running here (not audited by this script): sudo -u postgres psql -c '\\du' -c '\\l'"
+    return 0
+  fi
+  if ! dbq "select 1" | grep -q 1; then
+    warn "can't log in to the database as root without a password"
+    local pw; read -r -s -p "  Database root password (Enter = skip the database checks): " pw </dev/tty; echo
+    [ -n "$pw" ] || return 0; export MYSQL_PWD="$pw"
+    dbq "select 1" | grep -q 1 || { bad "that password didn't work - skipping the database checks"; unset MYSQL_PWD; return 0; }
+    plan_add "keep the database root password in /root/.my.cnf (root-only) so backups and checks work" "printf '[client]\\nuser=root\\npassword=\"%s\"\\n' $(q "$pw") > /root/.my.cnf && chmod 600 /root/.my.cnf"
+  fi
+  local ver appu u h plugin nopw su fi gr name dl f x n=0 isapp
+  ver=$(dbq "select version()"); say "server version: ${BO}$ver${N}"
+  case "$ver" in 5.1.*|5.5.[0-9]|5.5.[0-9]-*|5.5.1[0-9]*|5.5.2[0-3]*|5.2.*|5.3.*) bad "version $ver may have CVE-2012-2122 (log in as root by retrying a wrong password). Lock root to localhost, update the package if you can.";; esac
+  # the app's own database user(s): never touched by [a]ll
+  appu=$(sed -nE 's#.*://([^:@/]+)[:@].*#\1#p; s#.*(DB_USER(NAME)?|MYSQL_USER|DATABASE_USER(NAME)?)["'"'"' ]*[=:][ "'"'"']*([^"'"'"' ;]+).*#\4#Ip' "$W/dburls" 2>/dev/null | sort -u | tr '\n' ' ')
+  [ -n "$appu" ] && say "the web app logs in as: ${BO}$appu${N}(changing these breaks the app unless you update its config too)"
+  say "database accounts:"
+  while IFS=$'\t' read -r u h plugin nopw su fi gr; do
+    [ -n "$h" ] || continue; n=$((n+1)); isapp=""; [ "$u" = "(anon)" ] && u=""; case " $appu " in *" $u "*) isapp=risky;; esac; local locked=""
+    printf '      %-18s %-16s %-22s %s\n' "${u:-(anonymous)}" "$h" "$plugin" "$([ "$su$fi$gr" != NNN ] && echo "SUPER=$su FILE=$fi GRANT=$gr")"
+    case "$u" in mariadb.sys|mysql.sys|mysql.session|mysql.infoschema|mysql) continue;; esac
+    local acct="'$(sqs "$u")'@'$(sqs "$h")'"
+    if [ -z "$u" ]; then bad "anonymous database login allowed from $h"; plan_add "remove anonymous database login @$h" "dbx $(q "DROP USER $acct")"; continue; fi
+    if [ "$nopw" = 1 ] && [ "$plugin" != unix_socket ] && [ "$plugin" != auth_socket ] && [ "$plugin" != invalid ]; then bad "database account $u@$h has NO password"
+      plan_add "lock database account $u@$h (no password)" "dbx $(q "ALTER USER $acct ACCOUNT LOCK")" "$isapp"; locked=1; fi
+    if [ "$u" = root ]; then case "$h" in localhost|127.0.0.1|::1) ;; *) bad "database root can log in from the network ($h)"
+      plan_add "lock database root@$h (network root login)" "dbx $(q "ALTER USER $acct ACCOUNT LOCK")" "$isapp";; esac; continue; fi
+    [ "$fi" = Y ] && { bad "$u@$h has FILE privilege (read/write files on the server, e.g. drop a PHP webshell)"; plan_add "revoke FILE from $u@$h" "dbx $(q "REVOKE FILE ON *.* FROM $acct")" "$isapp"; }
+    [ "$su" = Y ] && { bad "$u@$h has SUPER (database admin)"; plan_add "revoke SUPER from $u@$h" "dbx $(q "REVOKE SUPER ON *.* FROM $acct")" "$isapp"; }
+    [ "$gr" = Y ] && { warn "$u@$h can GRANT privileges to others"; plan_add "revoke GRANT OPTION from $u@$h" "dbx $(q "REVOKE GRANT OPTION ON *.* FROM $acct")" "$isapp"; }
+    if [ -z "$isapp" ] && [ "$u" != root ] && [ -z "$locked" ]; then warn "extra database account: $u@$h (not the app's) - could be red team, could be scored"
+      plan_add "lock database account $u@$h (extra account) ${R}(check it isn't scored)${N}" "dbx $(q "ALTER USER $acct ACCOUNT LOCK")" risky; fi
+  done < <(dbq "select if(user='','(anon)',user),host,plugin,authentication_string='',Super_priv,File_priv,Grant_priv from mysql.user")
+  [ "$n" = 0 ] && warn "couldn't read mysql.user (not enough privilege?)"
+  # user-defined functions = run system commands from SQL
+  while IFS=$'\t' read -r name dl; do [ -n "$name" ] || continue
+    bad "user-defined function ${BO}$name${N} from $dl (runs code inside the database server)"
+    plan_add "drop database function $name (UDF from $dl)" "dbx $(q "DROP FUNCTION IF EXISTS \`$name\`")"
+  done < <(dbq "select name,dl from mysql.func")
+  x=$(dbq "select @@plugin_dir")
+  [ -d "$x" ] && for f in "$x"/*.so; do [ -f "$f" ] || continue; owned "$f" && continue
+    bad "database plugin file not from a package: $f"; plan_add "quarantine database plugin $f" "quar $(q "$f")"; done
+  # settings
+  x=$(dbq "select @@secure_file_priv"); case "$x" in
+    "") bad "secure_file_priv is EMPTY: SQL can read/write files anywhere mysqld can (INTO OUTFILE -> webshell)"
+        tip "fix (needs a database restart = brief outage): add 'secure_file_priv=/var/lib/mysql-files' under [mysqld] in /etc/my.cnf.d/, mkdir that folder (owner mysql), restart mariadb";;
+    NULL) ok "secure_file_priv = NULL (file import/export disabled)";; *) ok "secure_file_priv limited to $x";; esac
+  if [ "$(dbq "select @@local_infile")" = 1 ]; then warn "local_infile is ON (clients can make the server read their files)"
+    plan_add "turn off local_infile (now + after restart)" "dbx 'SET GLOBAL local_infile=0' && mkdir -p /etc/my.cnf.d && printf '[mysqld]\nlocal_infile=0\n' > /etc/my.cnf.d/zz-tk.cnf"; fi
+  x=$(dbq "select @@bind_address"); say "listens on: ${BO}${x:-all addresses}${N} $(case "$x" in 127.*|localhost|::1) echo "(local only)";; *) echo "(other boxes can connect - fine if they need to; the firewall keeps it open)";; esac)"
+  # databases + columns that look like credentials / personal data
+  x=$(dbq "show databases" | grep -vxE 'information_schema|performance_schema|mysql|sys' | tr '\n' ' ')
+  say "databases: ${BO}${x:-none}${N}"
+  x=$(dbq "select concat(table_schema,'.',table_name,'.',column_name) from information_schema.columns where table_schema not in ('information_schema','performance_schema','mysql','sys') and column_name regexp 'pass|pwd|hash|secret|token|card|ccn|cvv|ssn|social|email|phone|address|dob|birth' limit 40")
+  [ -n "$x" ] && { warn "columns that look like passwords or personal data (protect these; mention in reports):"; echo "$x" | sed 's/^/      /'; }
+  plan_add "set a NEW password for the database root (you type it; root still logs in locally without one on MariaDB)" "db_rootpw" risky
+  tip "dumps of every database are in the backup step (README.gz). Nothing here deletes data."
+  return 0
 }
 
 # ======================================================================
@@ -672,7 +806,7 @@ lan_name() { case "$1" in 192.168.220.2) echo "vigra (router)";; 192.168.220.79)
   192.168.220.97) echo "skerja (tickets)";; 192.168.220.222) echo "djupi (POS)";; 192.168.220.231) echo "thorska (this box)";; 192.168.220.*) echo "LAN host (not in packet!)";; *) echo "internet";; esac; }
 fw_in_ports() {  # $1 = tcp|udp : every port listening on a non-loopback address, plus 22 for tcp
   local fl=-Htln; [ "$1" = udp ] && fl=-Huln
-  { [ "$1" = tcp ] && echo 22; ss $fl 2>/dev/null | awk '{print $4}' | grep -vE '^(127\.|\[::1\]|.*%lo)' | sed 's/.*://'; } | grep -E '^[0-9]+$' | sort -nu | tr '\n' ',' | sed 's/,$//'
+  { [ "$1" = tcp ] && echo 22; ss $fl 2>/dev/null | awk '{print $4}' | grep -vE '^(127\.|\[::1\]|.*%lo)' | sed 's/.*://'; } | grep -E '^[0-9]+$' | grep -vxE '2375|2376' | sort -nu | tr '\n' ',' | sed 's/,$//'   # never open the Docker API
 }
 fw_joined() { realm list 2>/dev/null | grep -q domain-name || svc_active sssd; }
 fw_render() {  # fw_render learn|lock  -> $FW/rules.nft
@@ -687,6 +821,7 @@ fw_render() {  # fw_render learn|lock  -> $FW/rules.nft
     echo "  chain input {"
     echo "    type filter hook input priority -5; policy drop;"
     echo "    iif \"lo\" accept"
+    for l in docker0 'br-*' 'podman*' 'cni-podman*'; do echo "    iifname \"$l\" tcp dport != { 2375, 2376 } accept"; done   # containers <-> host
     echo "    ct state established,related accept"
     echo "    ct state invalid drop"
     echo "    meta l4proto { icmp, ipv6-icmp } accept"
@@ -701,6 +836,7 @@ fw_render() {  # fw_render learn|lock  -> $FW/rules.nft
     echo "  chain output {"
     echo "    type filter hook output priority -5; policy $([ "$mode" = lock ] && echo drop || echo accept);"
     echo "    oif \"lo\" accept"
+    for l in docker0 'br-*' 'podman*' 'cni-podman*'; do echo "    oifname \"$l\" accept"; done   # host -> its own containers (web server proxying to a container)
     echo "    ct state established,related accept"
     echo "    meta l4proto { icmp, ipv6-icmp } accept"
     echo "    udp dport { 53, 67, 123, 547 } accept"
@@ -878,6 +1014,8 @@ cmd_protect() {
     Permissive) warn "SELinux is Permissive (logging only). Don't switch it to Enforcing mid-competition - it can break the app.";;
     *) warn "SELinux is $se";;
   esac
+
+  db_audit
 
   plan_apply
   sub "Fingerprint the app (so hunt/watch catch defacement)"
@@ -1077,7 +1215,7 @@ STEPS=("Passwords (zulu-compatible)|cmd_passwd|creates ccdcuser1+2, you set root
        "Backups + database dump|cmd_backup|disguised, backdated copies of configs, app files and the database|optional passphrase (Enter = none)"
        "Harden SSH|cmd_ssh|no root login, 3 tries, no tunnels - passwords stay on|apply / skip"
        "Firewall: inbound lock + outbound learn|cmd_fw fw learn|keeps every listening port open, logs where the box connects out, 90s auto-undo|type yes to keep it"
-       "Protect the web app|cmd_protect|webshell scan, leak check, version hiding, secret file permissions, SELinux, fingerprint|one plan: apply all / pick / skip"
+       "Protect the web app + database|cmd_protect|webshell scan, leak check, version hiding, secret file permissions, SELinux, fingerprint, database accounts/UDFs/FILE|one plan: apply all / pick / skip"
        "Recon + baseline + health check|cmd_finish|saves the inventory, sets the baseline for hunt/watch, checks every service|nothing")
 cmd_finish() { cmd_recon; cmd_rebase; cmd_check; }
 cmd_first() {
@@ -1157,7 +1295,7 @@ case "${1:-}" in
   web) run_step "Find web app" cmd_web;;  protect) run_step Protect cmd_protect;;
   fw) run_step Firewall cmd_fw "$@";;
   backup) run_step Backup cmd_backup;;  restore) run_step Restore cmd_restore "$@";;
-  evict) run_step Evict cmd_evict;;  passwd) run_step Passwords cmd_passwd;;  ssh) run_step SSH cmd_ssh;;
+  evict) run_step Evict cmd_evict;;  docker) run_step Docker cmd_docker;;  db) run_step Database cmd_db;;  passwd) run_step Passwords cmd_passwd;;  ssh) run_step SSH cmd_ssh;;
   recon) cmd_recon;;  report) cmd_report;;  rebase) cmd_rebase;;
   seedshow) cmd_seedshow "$@";;
   -h|--help|help) sed -n '2,22p' "$SELF";;
